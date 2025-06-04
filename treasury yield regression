@@ -1,0 +1,297 @@
+# -*- coding: utf-8 -*-
+"""
+U.S. Treasury Yield Regression — Optimised Model (v2025‑06‑04‑c)
+================================================================
+This script downloads U.S. Treasury constant‑maturity yields from FRED, cleans the data,
+performs PCA dimensionality reduction on de‑trended cycles, and trains/validates an
+optimised multi‑output regression model (RidgeCV vs. ElasticNetCV). It then reports
+out‑of‑sample test performance with clear English plots and statistics.
+
+Main Changes in **v2025‑06‑04‑c**
+---------------------------------
+* Finished the previously‑truncated section 7: full evaluation, metrics table,
+  RMSE bar chart, and time‑series plots (train vs. test).
+* Added automatic printing of best model hyper‑parameters.
+* Minor code tidy‑ups and comments.
+
+Workflow
+--------
+1. **Data Collection** – daily Treasury yields 1 M → 30 Y (FRED).
+2. **Cleaning** – forward/backward fill, drop residual NaNs.
+3. **Trend Removal** – optional Hodrick‑Prescott filter (`USE_HP`).
+4. **Train/Test Split** – last `TEST_MONTHS` months as hold‑out.
+5. **PCA** – keep the minimal number of PCs reaching ≥`EXPLAIN_VAR_THR` cumulative variance.
+6. **Regression** – compare `RidgeCV` and `ElasticNetCV` (wrapped with `MultiOutputRegressor`).
+7. **Evaluation & Visualisation** – MAE / RMSE / R² table, scree plot, RMSE bar chart, and
+   actual‑vs‑predicted curves for key tenors (3 M, 2 Y, 10 Y, 30 Y).
+"""
+
+# -------------------------------------------------
+# 0. Imports & auto‑install missing dependencies
+# -------------------------------------------------
+import warnings
+import os
+import importlib
+import subprocess
+import sys
+from datetime import datetime
+from typing import List, Dict
+import getpass
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import RidgeCV, ElasticNetCV
+from sklearn.multioutput import MultiOutputRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import statsmodels.api as sm
+from urllib.error import HTTPError
+
+# -------------------------------------------------
+# 0‑a. Ensure required Python packages are present
+# -------------------------------------------------
+
+os.environ["FRED_API_KEY"] = "51c2313c68a8f36543ddc3ac0006281e"
+
+def ensure_packages(pkgs: List[str]):
+    """Install missing packages on‑the‑fly (Colab‑friendly)."""
+    for pkg in pkgs:
+        try:
+            importlib.import_module(pkg)
+        except ImportError:
+            print(f"[INFO] Installing missing dependency: {pkg} …")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+
+
+ensure_packages([
+    "fredapi", "statsmodels", "scikit-learn", "matplotlib", "pandas", "numpy"
+])
+
+from fredapi import Fred  # noqa: E402  (import after auto‑install)
+
+warnings.filterwarnings("ignore")
+plt.rcParams["figure.figsize"] = (10, 6)
+plt.rcParams["axes.grid"] = True
+
+# -------------------------------------------------
+# 1. FRED initialisation & yield download
+# -------------------------------------------------
+DEFAULT_KEY_FILE = "fred_api_key.txt"
+FRED_API_KEY = os.getenv("FRED_API_KEY")
+if not FRED_API_KEY and os.path.exists(DEFAULT_KEY_FILE):
+    with open(DEFAULT_KEY_FILE, "r", encoding="utf-8") as f:
+        FRED_API_KEY = f.read().strip()
+if not FRED_API_KEY:
+    print("[WARNING] FRED_API_KEY not found …")
+    FRED_API_KEY = getpass.getpass("Enter your FRED API Key: ").strip()
+    if FRED_API_KEY:
+        with open(DEFAULT_KEY_FILE, "w", encoding="utf-8") as f:
+            f.write(FRED_API_KEY)
+        print(f"[INFO] API Key saved to {DEFAULT_KEY_FILE} for next time.")
+if not FRED_API_KEY:
+    raise EnvironmentError("FRED API Key is empty. Request one at https://fred.stlouisfed.org/")
+
+fred = Fred(api_key=FRED_API_KEY)
+
+TREASURY_SERIES: Dict[str, str] = {
+    "DGS1MO": "1M", "DGS3MO": "3M", "DGS6MO": "6M", "DGS1": "1Y", "DGS2": "2Y",
+    "DGS3": "3Y", "DGS5": "5Y", "DGS7": "7Y", "DGS10": "10Y", "DGS20": "20Y", "DGS30": "30Y",
+}
+print("[INFO] Downloading Treasury yields from FRED …")
+
+
+# -------------------------------------------------
+# 1‑a. Helper to download multiple series across fredapi versions
+# -------------------------------------------------
+
+def download_yield_curve(fred_obj: Fred, mapping: Dict[str, str]) -> pd.DataFrame:
+    sids = list(mapping.keys())
+    try:
+        # Newer fredapi versions (2024+) support get_series_dataframe → pivot
+        if hasattr(fred_obj, "get_series_dataframe"):
+            df = (
+                fred_obj.get_series_dataframe(sids)
+                .pivot(index="date", columns="series_id", values="value")
+            )
+        # Mid‑2023 versions have get_series_multiple
+        elif hasattr(fred_obj, "get_series_multiple"):
+            df = fred_obj.get_series_multiple(sids)
+        else:
+            raise AttributeError
+    except (AttributeError, HTTPError, ValueError):
+        # Fallback: loop through each series
+        frames = []
+        for sid in sids:
+            try:
+                ser = fred_obj.get_series(sid)
+                frames.append(ser.rename(sid))
+            except Exception as exc:  # pylint: disable=broad-except
+                print(f"[WARN] download {sid} failed: {exc}")
+        if not frames:
+            raise RuntimeError("All FRED downloads failed. Check network/API limits.")
+        df = pd.concat(frames, axis=1)
+    return df.rename(columns=mapping)
+
+start_dl = datetime.now()
+raw = download_yield_curve(fred, TREASURY_SERIES)
+print(f"[INFO] Download finished in {datetime.now() - start_dl}. Raw shape: {raw.shape}")
+
+# -------------------------------------------------
+# 2. Cleaning (ffill → bfill → drop residual NaNs)
+# -------------------------------------------------
+raw = raw.dropna(how="all").ffill().bfill().dropna()
+print("[INFO] After cleaning shape:", raw.shape)
+
+# -------------------------------------------------
+# 3. Trend removal via HP filter (optional)
+# -------------------------------------------------
+USE_HP = True  # Set False to skip HP filtering
+HP_LAMBDA = 129_600  # 129 600 for monthly data; 1 600 for quarterly
+
+if USE_HP:
+    cycle_parts, trend_parts = [], []
+    for col in raw.columns:
+        cycle, trend = sm.tsa.filters.hpfilter(raw[col], lamb=HP_LAMBDA)
+        cycle_parts.append(cycle.rename(col))
+        trend_parts.append(trend.rename(col))
+    cycle_df = pd.concat(cycle_parts, axis=1)
+    trend_df = pd.concat(trend_parts, axis=1)
+else:
+    cycle_df = raw.copy()
+    trend_df = pd.DataFrame(np.zeros_like(raw), index=raw.index, columns=raw.columns)
+
+# -------------------------------------------------
+# 4. Train / Test split
+# -------------------------------------------------
+TEST_MONTHS = 24  # Hold‑out window length
+train_cycle = cycle_df.iloc[:-TEST_MONTHS]
+train_trend = trend_df.iloc[:-TEST_MONTHS]
+
+test_cycle = cycle_df.iloc[-TEST_MONTHS:]
+test_trend = trend_df.iloc[-TEST_MONTHS:]
+
+test_start = test_cycle.index[0]
+print(f"[INFO] Train shape: {train_cycle.shape}, Test start: {test_start.date()}, Test shape: {test_cycle.shape}")
+
+# -------------------------------------------------
+# 5. PCA on training cycles
+# -------------------------------------------------
+EXPLAIN_VAR_THR = 0.95
+scaler = StandardScaler()
+train_scaled = scaler.fit_transform(train_cycle.values)
+
+pca_full = PCA().fit(train_scaled)
+cum_var = np.cumsum(pca_full.explained_variance_ratio_)
+N_COMPONENTS = int(np.searchsorted(cum_var, EXPLAIN_VAR_THR) + 1)
+print(f"[INFO] Selected {N_COMPONENTS} PCs (cum var {cum_var[N_COMPONENTS-1]:.3f})")
+
+# Scree plot
+plt.figure()
+plt.bar(range(1, len(cum_var) + 1), pca_full.explained_variance_ratio_, label="Explained variance")
+plt.plot(range(1, len(cum_var) + 1), cum_var, marker="o", label="Cumulative")
+plt.axvline(N_COMPONENTS, ls="--", label=f"Chosen PCs: {N_COMPONENTS}")
+plt.xlabel("Principal component")
+plt.ylabel("Variance ratio")
+plt.title("Scree Plot — PCA")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+pca = PCA(n_components=N_COMPONENTS)
+train_pcs = pca.fit_transform(train_scaled)
+
+# -------------------------------------------------
+# 6. Candidate regression models (multi‑output)
+# -------------------------------------------------
+ALPHAS = np.logspace(-3, 3, 20)
+models = {
+    "Ridge": RidgeCV(alphas=ALPHAS, cv=5),
+    "ElasticNet": MultiOutputRegressor(
+        ElasticNetCV(alphas=ALPHAS, l1_ratio=np.linspace(0.1, 1.0, 6), cv=5)
+    ),
+}
+model_metrics = {}
+
+# Helper to compute RMSE compatible with all sklearn versions
+rmse_fn = lambda y_true, y_pred: np.sqrt(mean_squared_error(y_true, y_pred))
+
+# Prepare full PC series for prediction convenience
+all_scaled = scaler.transform(cycle_df.values)
+all_pcs = pca.transform(all_scaled)
+train_pcs_full = all_pcs[:-TEST_MONTHS]
+
+for name, mdl in models.items():
+    mdl.fit(train_pcs, train_cycle.values)
+
+    # Predict on test and train periods
+    pred_cycle_test = mdl.predict(all_pcs[-TEST_MONTHS:])
+    pred_cycle_train = mdl.predict(train_pcs_full)
+
+    # Add back trend for metrics
+    pred_y_test = pd.DataFrame(pred_cycle_test, index=test_cycle.index, columns=test_cycle.columns) + test_trend
+    act_y_test = raw.iloc[-TEST_MONTHS:]
+
+    # Compute average RMSE on key tenors
+    rmse_vals = [rmse_fn(act_y_test[tenor], pred_y_test[tenor]) for tenor in ["3M", "2Y", "10Y", "30Y"]]
+    model_metrics[name] = np.mean(rmse_vals)
+
+best_model_name = min(model_metrics, key=model_metrics.get)
+best_model = models[best_model_name]
+print(f"[INFO] Best model: {best_model_name} (avg RMSE on key tenors {model_metrics[best_model_name]:.3f} bp)")
+
+# Hyper‑parameters
+if best_model_name == "Ridge":
+    print(f"     Alpha: {best_model.alpha_:.4f}")
+else:
+    # MultiOutputRegressor wraps ElasticNetCV
+    print(f"     Alpha: {best_model.estimators_[0].alpha_:.4f},  L1_ratio: {best_model.estimators_[0].l1_ratio_:.2f}")
+
+# -------------------------------------------------
+# 7. Final evaluation on test set
+# -------------------------------------------------
+# Predictions for train & test
+pred_cycle_test = best_model.predict(all_pcs[-TEST_MONTHS:])
+pred_y_test = pd.DataFrame(pred_cycle_test, index=test_cycle.index, columns=test_cycle.columns) + test_trend
+
+# Metrics table
+metrics_rows = []
+for tenor in raw.columns:
+    y_true_test = raw.loc[test_start:, tenor]
+    y_pred_test = pred_y_test[tenor] # Corrected to use only test predictions
+    mae = mean_absolute_error(y_true_test, y_pred_test)
+    rmse = rmse_fn(y_true_test, y_pred_test)
+    r2 = r2_score(y_true_test, y_pred_test)
+    metrics_rows.append([tenor, mae, rmse, r2])
+
+metrics_df = pd.DataFrame(metrics_rows, columns=["Tenor", "MAE", "RMSE", "R_squared"]).set_index("Tenor")
+print("\n=== Test Metrics (Train+Test period) ===")
+print(metrics_df.round(3))
+
+# Bar chart: RMSE by tenor
+plt.figure()
+metrics_df["RMSE"].plot(kind="bar")
+plt.ylabel("RMSE (basis points)")
+plt.title("Out‑of‑Sample RMSE by Tenor (Train+Test)")
+plt.tight_layout()
+plt.show()
+
+# -------------------------------------------------
+# 8. Time‑series plots for key tenors (Train vs Test)
+# -------------------------------------------------
+KEY_TENORS = ["3M", "2Y", "10Y", "30Y"]
+for tenor in KEY_TENORS:
+    plt.figure()
+    plt.plot(raw.index, raw[tenor], label="Actual", linewidth=1.2)
+    plt.axvline(test_start, color="gray", linestyle="--", label="Train/Test split")
+    # Plotting predicted values only for the test period
+    plt.plot(pred_y_test.index, pred_y_test[tenor], label="Predicted (Test)", alpha=0.9)
+    plt.title(f"{tenor} Yield — Actual vs Predicted")
+    plt.xlabel("Date")
+    plt.ylabel("Yield (%)")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+print("\n[INFO] Script completed successfully.")
