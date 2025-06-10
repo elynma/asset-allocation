@@ -1,2 +1,2 @@
 # asset-allocation
-factor based asset allocation model for global infrastructure investment
+asset allocation model for global infrastructure investment
